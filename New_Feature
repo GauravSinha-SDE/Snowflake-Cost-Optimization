@@ -1,0 +1,52 @@
+-- ══════════════════════════════════════════════════════════════
+-- NATIVE QUERY INSIGHTS — replaces custom regex anti-pattern detection
+-- Uses SNOWFLAKE.ACCOUNT_USAGE.QUERY_INSIGHTS (free, Snowflake-maintained)
+-- Joined to V_APP_ROLE_MAPPING (APP_ roles only)
+-- ══════════════════════════════════════════════════════════════
+
+WITH insights AS (
+    SELECT
+        qi.query_id,
+        qi.insight_type_id,
+        qi.insight_topic,
+        qi.message:"title"::STRING                    AS issue_title,
+        ARRAY_TO_STRING(qi.suggestions, ' | ')        AS snowflake_recommendation,
+        qi.start_time,
+        qh.role_name,
+        m.app_name,
+        qh.warehouse_name,
+        qh.warehouse_size,
+        qh.query_type,
+        qh.query_parameterized_hash,
+        ROUND(
+            (qh.total_elapsed_time / 3600000.0)
+            * CASE qh.warehouse_size
+                WHEN 'X-Small' THEN 1   WHEN 'Small'  THEN 2
+                WHEN 'Medium'  THEN 4   WHEN 'Large'  THEN 8
+                WHEN 'X-Large' THEN 16  WHEN '2X-Large' THEN 32
+                ELSE 1 END
+            * qh.cluster_number, 6)                    AS est_credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_INSIGHTS qi
+    JOIN SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY qh
+        ON qi.query_id = qh.query_id
+    INNER JOIN V_APP_ROLE_MAPPING m
+        ON qh.role_name = m.role_name
+    WHERE qi.start_time >= DATEADD('day', -14, CURRENT_TIMESTAMP)
+)
+SELECT
+    app_name,
+    insight_type_id,
+    insight_topic,
+    issue_title,
+    -- Snowflake's own recommendation — no custom logic needed
+    ANY_VALUE(snowflake_recommendation)                AS snowflake_recommendation,
+    COUNT(*)                                           AS occurrence_count,
+    COUNT(DISTINCT query_parameterized_hash)           AS distinct_query_patterns,
+    ROUND(SUM(est_credits), 4)                         AS total_credits_affected,
+    LISTAGG(DISTINCT warehouse_name, ' | ')
+        WITHIN GROUP (ORDER BY warehouse_name)         AS warehouses,
+    -- Is this warehouse Gen1? (Optima would auto-fix on Gen2)
+    'Check: SHOW WAREHOUSES — if GEN1, migrate to GEN2 for free Optima' AS gen2_note
+FROM insights
+GROUP BY app_name, insight_type_id, insight_topic, issue_title
+ORDER BY total_credits_affected DESC;
