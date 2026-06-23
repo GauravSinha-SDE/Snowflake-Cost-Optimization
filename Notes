@@ -1,50 +1,302 @@
--- Identifies tables rebuilt repeatedly via CREATE OR REPLACE TRANSIENT TABLE
--- Fix: non-capturing groups (?:) → removed, \s → [[:space:]], \S → [^[:space:]]
+-- ══════════════════════════════════════════════════════════════
+-- QUERY ANTI-PATTERN CLASSIFIER
+-- Input  : Flagged objects from CoE Excel (high partition scan)
+-- Output : Actual SQL patterns hitting each object + rewrite fix
+-- ══════════════════════════════════════════════════════════════
 
-WITH ctas_queries AS (
-    SELECT
-        REGEXP_SUBSTR(
-            UPPER(QUERY_TEXT),
-            'CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?(TRANSIENT[[:space:]]+)?TABLE[[:space:]]+([^[:space:]]+)',
-            1, 1, 'ie', 3          -- flag 'i'=case-insensitive, 'e'=extract, group 3 = table name
-        )                                              AS target_table,
-        QUERY_ID,
-        WAREHOUSE_NAME,
-        WAREHOUSE_SIZE,
-        USER_NAME,
-        ROLE_NAME,
-        START_TIME,
-        TOTAL_ELAPSED_TIME / 1000                      AS elapsed_sec,
-        (TOTAL_ELAPSED_TIME / 3600000.0)
-            * CASE WAREHOUSE_SIZE
-                WHEN 'X-Small' THEN 1
-                WHEN 'Small'   THEN 2
-                WHEN 'Medium'  THEN 4
-                WHEN 'Large'   THEN 8
-                ELSE 1 END                             AS est_credits
-    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
-    WHERE START_TIME        >= DATEADD('day', -14, CURRENT_TIMESTAMP)
-      AND QUERY_TYPE        IN ('CREATE_TABLE_AS_SELECT', 'CREATE_TABLE')
-      AND EXECUTION_STATUS  = 'SUCCESS'
-      AND UPPER(QUERY_TEXT) LIKE '%CREATE%TABLE%SELECT%'
+WITH flagged_objects AS (
+    -- Paste CoE-flagged apps here, or join to an ingested table
+    SELECT column1 AS app_name FROM VALUES
+        ('Kinaxis Rapid Response'),
+        ('Supply Chain Analytics'),
+        ('Commercial Analytics'),
+        ('Analytics Common Data'),
+        ('Financial Planning and Analysis (FP and A) Analytics'),
+        ('Unified Common Model Framework'),
+        ('RGM Analytics'),
+        ('eCompass'),
+        ('LAO Consumer Sales Reporting'),
+        ('Global eDPSM Analytics (CRISP)'),
+        ('Commercial Analytics Sell Out Shared'),
+        ('KCP Customer Analytics - Global')
 ),
-aggregated AS (
+
+base AS (
     SELECT
-        target_table,
-        COUNT(*)                                       AS rebuild_count,
-        ROUND(SUM(est_credits), 4)                     AS total_credits,
-        ROUND(AVG(elapsed_sec), 1)                     AS avg_elapsed_sec,
-        MIN(START_TIME)                                AS first_run,
-        MAX(START_TIME)                                AS last_run,
+        q.QUERY_ID,
+        q.QUERY_TEXT,
+        q.QUERY_TYPE,
+        q.EXECUTION_STATUS,
+        q.ERROR_CODE,
+        q.USER_NAME,
+        q.ROLE_NAME,
+        q.WAREHOUSE_NAME,
+        q.WAREHOUSE_SIZE,
+        q.CLUSTER_NUMBER,
+        q.START_TIME,
+        q.TOTAL_ELAPSED_TIME,
+        q.PARTITIONS_SCANNED,
+        q.PARTITIONS_TOTAL,
+        q.BYTES_SPILLED_TO_LOCAL_STORAGE,
+        q.BYTES_SPILLED_TO_REMOTE_STORAGE,
         ROUND(
-            DATEDIFF('hour', MIN(START_TIME), MAX(START_TIME))
-            / NULLIF(COUNT(*) - 1, 0), 2)             AS avg_hrs_between_runs,
-        MAX(WAREHOUSE_NAME)                            AS warehouse_name
-    FROM ctas_queries
-    WHERE target_table IS NOT NULL
-    GROUP BY target_table
-    HAVING COUNT(*) > 10
+            (q.TOTAL_ELAPSED_TIME / 3600000.0)
+            * CASE q.WAREHOUSE_SIZE
+                WHEN 'X-Small' THEN 1   WHEN 'Small'  THEN 2
+                WHEN 'Medium'  THEN 4   WHEN 'Large'  THEN 8
+                ELSE 1 END
+            * q.CLUSTER_NUMBER, 6)                     AS est_credits,
+        ROUND(DIV0(q.PARTITIONS_SCANNED,
+              q.PARTITIONS_TOTAL) * 100, 1)            AS partition_scan_pct
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY q
+    INNER JOIN flagged_objects f
+        ON UPPER(q.QUERY_TEXT) LIKE '%' || UPPER(f.app_name) || '%'
+        OR q.ROLE_NAME LIKE '%' || UPPER(REPLACE(f.app_name,' ','_')) || '%'
+    WHERE q.START_TIME        >= DATEADD('day', -14, CURRENT_TIMESTAMP)
+      AND q.EXECUTION_STATUS   = 'SUCCESS'
+      AND q.PARTITIONS_TOTAL   > 0
+      AND DIV0(q.PARTITIONS_SCANNED, q.PARTITIONS_TOTAL) > 0.70
+),
+
+-- ── Detect anti-patterns using Snowflake POSIX regex ─────────
+antipattern_flags AS (
+    SELECT
+        b.*,
+        -- 1. Non-SARGable: function wrapped around a column in WHERE/JOIN
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'WHERE[[:space:]].*(DATE_TRUNC|TO_DATE|TO_CHAR|CAST|YEAR|MONTH|DAY|DATEPART|CONVERT|UPPER|LOWER|TRIM|SUBSTR)[[:space:]]*[(]',
+                 'i') THEN 1 ELSE 0 END                AS flag_non_sargable,
+
+        -- 2. SELECT * (no column pruning)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'SELECT[[:space:]]*[*]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_select_star,
+
+        -- 3. Leading wildcard LIKE (cannot use micro-partition pruning)
+        CASE WHEN REGEXP_LIKE(b.QUERY_TEXT,
+                 'LIKE[[:space:]]*' || CHR(39) || '[%][^%]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_leading_wildcard,
+
+        -- 4. OR in WHERE (splits predicate — Snowflake cannot prune on OR)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'WHERE[[:space:]].*[[:space:]]OR[[:space:]]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_or_in_where,
+
+        -- 5. No WHERE clause at all (guaranteed full scan)
+        CASE WHEN NOT REGEXP_LIKE(UPPER(b.QUERY_TEXT), '[[:space:]]WHERE[[:space:]]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_no_where,
+
+        -- 6. NOT IN subquery (anti-join — disables pruning on inner table)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'NOT[[:space:]]+IN[[:space:]]*[(]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_not_in,
+
+        -- 7. SELECT DISTINCT with JOIN (fan-out symptom)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'SELECT[[:space:]]+DISTINCT', 'i')
+              AND REGEXP_LIKE(UPPER(b.QUERY_TEXT), '[[:space:]]JOIN[[:space:]]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_distinct_join,
+
+        -- 8. Repeated base table scan (same table referenced 3+ times in one query)
+        CASE WHEN REGEXP_COUNT(UPPER(b.QUERY_TEXT), '[[:space:]]FROM[[:space:]]') > 3
+             THEN 1 ELSE 0 END                         AS flag_repeated_scan,
+
+        -- 9. ILIKE (case-insensitive LIKE — disables micro-partition pruning entirely)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 '[[:space:]]ILIKE[[:space:]]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_ilike,
+
+        -- 10. Implicit type cast in filter (string literal matched to numeric column)
+        CASE WHEN REGEXP_LIKE(b.QUERY_TEXT,
+                 '(WHERE|AND|OR)[[:space:]]+[A-Z_]+[[:space:]]*=[[:space:]]*' || CHR(39) || '[0-9]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_implicit_cast,
+
+        -- 11. ORDER BY with no LIMIT (forces full sort of result set)
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'ORDER[[:space:]]+BY', 'i')
+              AND NOT REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'LIMIT[[:space:]]+[0-9]', 'i')
+             THEN 1 ELSE 0 END                         AS flag_order_no_limit,
+
+        -- 12. CROSS JOIN
+        CASE WHEN REGEXP_LIKE(UPPER(b.QUERY_TEXT),
+                 'CROSS[[:space:]]+JOIN', 'i')
+             THEN 1 ELSE 0 END                         AS flag_cross_join
+    FROM base b
+),
+
+-- ── Build primary anti-pattern label (worst offender first) ──
+classified AS (
+    SELECT
+        a.*,
+        -- Primary pattern (priority ordered — worst impact first)
+        CASE
+            WHEN flag_cross_join      = 1 THEN 'CROSS_JOIN'
+            WHEN flag_no_where        = 1 THEN 'NO_WHERE_CLAUSE'
+            WHEN flag_non_sargable    = 1 THEN 'NON_SARGABLE_FUNCTION'
+            WHEN flag_leading_wildcard= 1 THEN 'LEADING_WILDCARD_LIKE'
+            WHEN flag_ilike           = 1 THEN 'ILIKE_NO_PRUNING'
+            WHEN flag_not_in          = 1 THEN 'NOT_IN_SUBQUERY'
+            WHEN flag_or_in_where     = 1 THEN 'OR_IN_WHERE'
+            WHEN flag_distinct_join   = 1 THEN 'DISTINCT_WITH_JOIN'
+            WHEN flag_repeated_scan   = 1 THEN 'REPEATED_BASE_TABLE_SCAN'
+            WHEN flag_implicit_cast   = 1 THEN 'IMPLICIT_TYPE_CAST'
+            WHEN flag_order_no_limit  = 1 THEN 'ORDER_BY_NO_LIMIT'
+            WHEN flag_select_star     = 1 THEN 'SELECT_STAR'
+            ELSE                               'REVIEW_MANUALLY'
+        END                                            AS primary_antipattern,
+
+        -- All flags combined for full picture
+        TRIM(
+            CASE WHEN flag_no_where        = 1 THEN '| NO_WHERE_CLAUSE '         ELSE '' END ||
+            CASE WHEN flag_non_sargable    = 1 THEN '| NON_SARGABLE_FUNCTION '   ELSE '' END ||
+            CASE WHEN flag_select_star     = 1 THEN '| SELECT_STAR '             ELSE '' END ||
+            CASE WHEN flag_leading_wildcard= 1 THEN '| LEADING_WILDCARD_LIKE '   ELSE '' END ||
+            CASE WHEN flag_or_in_where     = 1 THEN '| OR_IN_WHERE '             ELSE '' END ||
+            CASE WHEN flag_not_in          = 1 THEN '| NOT_IN_SUBQUERY '         ELSE '' END ||
+            CASE WHEN flag_distinct_join   = 1 THEN '| DISTINCT_WITH_JOIN '      ELSE '' END ||
+            CASE WHEN flag_repeated_scan   = 1 THEN '| REPEATED_BASE_TABLE_SCAN 'ELSE '' END ||
+            CASE WHEN flag_ilike           = 1 THEN '| ILIKE_NO_PRUNING '        ELSE '' END ||
+            CASE WHEN flag_implicit_cast   = 1 THEN '| IMPLICIT_TYPE_CAST '      ELSE '' END ||
+            CASE WHEN flag_order_no_limit  = 1 THEN '| ORDER_BY_NO_LIMIT '       ELSE '' END ||
+            CASE WHEN flag_cross_join      = 1 THEN '| CROSS_JOIN '              ELSE '' END,
+        '| ')                                          AS all_antipatterns,
+
+        -- Specific rewrite recommendation per primary pattern
+        CASE
+            WHEN flag_cross_join = 1
+            THEN 'REWRITE: Remove CROSS JOIN — add ON clause or move to WHERE. '
+              || 'Cross joins multiply row counts and scan all partitions.'
+
+            WHEN flag_no_where = 1
+            THEN 'REWRITE: Add WHERE clause to filter partitions. '
+              || 'Without a filter Snowflake scans every micro-partition. '
+              || 'If full scan is intentional, use result caching or a Dynamic Table.'
+
+            WHEN flag_non_sargable = 1
+            THEN 'REWRITE: Move function off the column and onto the literal. '
+              || 'BAD:  WHERE DATE_TRUNC(''month'', ORDER_DATE) = ''2026-01-01'' '
+              || 'GOOD: WHERE ORDER_DATE >= ''2026-01-01'' AND ORDER_DATE < ''2026-02-01'' '
+              || 'BAD:  WHERE YEAR(TXN_DATE) = 2025 '
+              || 'GOOD: WHERE TXN_DATE BETWEEN ''2025-01-01'' AND ''2025-12-31'' '
+              || 'Functions on columns prevent micro-partition pruning.'
+
+            WHEN flag_leading_wildcard = 1
+            THEN 'REWRITE: Avoid leading wildcard LIKE patterns. '
+              || 'BAD:  WHERE PRODUCT_CODE LIKE ''%ABC'' '
+              || 'GOOD: Use SEARCH OPTIMIZATION on that column, '
+              || 'or restructure to LIKE ''ABC%'' if business logic allows.'
+
+            WHEN flag_ilike = 1
+            THEN 'REWRITE: Replace ILIKE with LIKE on pre-uppercased column. '
+              || 'BAD:  WHERE PRODUCT_NAME ILIKE ''%widget%'' '
+              || 'GOOD: WHERE UPPER(PRODUCT_NAME) LIKE ''%WIDGET%'' '
+              || 'Or add a persisted UPPER() column and index it via Search Optimization.'
+
+            WHEN flag_not_in = 1
+            THEN 'REWRITE: Replace NOT IN with LEFT JOIN / IS NULL (anti-join). '
+              || 'BAD:  WHERE ID NOT IN (SELECT ID FROM exclusions) '
+              || 'GOOD: LEFT JOIN exclusions e ON t.ID = e.ID WHERE e.ID IS NULL '
+              || 'NOT IN with subquery blocks partition pruning on the outer table.'
+
+            WHEN flag_or_in_where = 1
+            THEN 'REWRITE: Replace OR with UNION ALL to allow independent pruning. '
+              || 'BAD:  WHERE REGION = ''NA'' OR REGION = ''EU'' '
+              || 'GOOD: WHERE REGION IN (''NA'', ''EU'')   -- IN is rewritten as OR internally but pruning works '
+              || 'For different columns: '
+              || 'BAD:  WHERE STATUS = ''A'' OR ORDER_DATE > ''2026-01-01'' '
+              || 'GOOD: Split into UNION ALL so each branch prunes independently.'
+
+            WHEN flag_distinct_join = 1
+            THEN 'REWRITE: DISTINCT after JOIN indicates join grain mismatch (fan-out). '
+              || 'Fix the join to produce unique rows instead of deduplicating afterwards. '
+              || 'Check: is the joined table a dimension (1 row per key)? '
+              || 'If not, add GROUP BY or move to a subquery with pre-aggregation.'
+
+            WHEN flag_repeated_scan = 1
+            THEN 'REWRITE: Same base table referenced multiple times in one query. '
+              || 'Consolidate into a single CTE scanned once: '
+              || 'WITH base AS (SELECT * FROM big_table WHERE ...) '
+              || 'SELECT ... FROM base WHERE type = ''A'' '
+              || 'UNION ALL '
+              || 'SELECT ... FROM base WHERE type = ''B'' '
+              || 'Each FROM clause triggers a separate scan of the object.'
+
+            WHEN flag_implicit_cast = 1
+            THEN 'REWRITE: Implicit type cast in filter prevents pruning. '
+              || 'BAD:  WHERE MATERIAL_ID = ''12345''  -- numeric col vs string literal '
+              || 'GOOD: WHERE MATERIAL_ID = 12345 '
+              || 'Snowflake casts every row to compare — cannot use min/max metadata.'
+
+            WHEN flag_order_no_limit = 1
+            THEN 'REWRITE: ORDER BY without LIMIT forces full result sort in memory. '
+              || 'If used inside a CTAS: remove ORDER BY — table storage order '
+              || 'does not affect query performance in Snowflake. '
+              || 'If used for reporting: add LIMIT N or push sort to the BI layer.'
+
+            WHEN flag_select_star = 1
+            THEN 'REWRITE: Replace SELECT * with explicit column list. '
+              || 'Snowflake fetches all columns even if downstream only uses 3. '
+              || 'Run: SELECT * FROM <table> LIMIT 0 to see the schema, '
+              || 'then specify only needed columns. '
+              || 'Columnar storage makes this a direct credit saving.'
+
+            ELSE 'REVIEW MANUALLY: Scan >70% but no standard anti-pattern detected. '
+              || 'Likely causes: no clustering key on filter column, '
+              || 'data skew on partition column, or view with missing predicate pushdown.'
+        END                                            AS rewrite_recommendation
+    FROM antipattern_flags a
+),
+
+-- ── Fingerprint + deduplicate to show distinct patterns ───────
+fingerprinted AS (
+    SELECT
+        c.*,
+        MD5(
+            REGEXP_REPLACE(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(UPPER(c.QUERY_TEXT), '''[^'']*''', '?'),
+                    '[0-9]+', '?'),
+                '[[:space:]]+', ' ')
+        )                                              AS query_fingerprint
+    FROM classified c
 )
-SELECT *
-FROM aggregated
-ORDER BY total_credits DESC;
+
+-- ── Final output: one row per distinct query pattern ──────────
+SELECT
+    query_fingerprint,
+    ROLE_NAME                                          AS app_role,
+    WAREHOUSE_NAME,
+    QUERY_TYPE,
+    primary_antipattern,
+    all_antipatterns,
+    COUNT(*)                                           AS execution_count,
+    ROUND(SUM(est_credits), 4)                         AS total_credits,
+    ROUND(AVG(partition_scan_pct), 1)                  AS avg_partition_scan_pct,
+    SUM(BYTES_SPILLED_TO_LOCAL_STORAGE)                AS bytes_spilled_local,
+    SUM(BYTES_SPILLED_TO_REMOTE_STORAGE)               AS bytes_spilled_remote,
+    MIN(START_TIME)                                    AS first_seen,
+    MAX(START_TIME)                                    AS last_seen,
+    -- Sample of actual query text
+    ANY_VALUE(LEFT(QUERY_TEXT, 500))                   AS query_sample,
+    -- The fix
+    ANY_VALUE(rewrite_recommendation)                  AS rewrite_recommendation
+FROM fingerprinted
+GROUP BY 1, 2, 3, 4, 5, 6
+ORDER BY
+    CASE primary_antipattern
+        WHEN 'CROSS_JOIN'              THEN 1
+        WHEN 'NO_WHERE_CLAUSE'         THEN 2
+        WHEN 'NON_SARGABLE_FUNCTION'   THEN 3
+        WHEN 'LEADING_WILDCARD_LIKE'   THEN 4
+        WHEN 'ILIKE_NO_PRUNING'        THEN 5
+        WHEN 'NOT_IN_SUBQUERY'         THEN 6
+        WHEN 'OR_IN_WHERE'             THEN 7
+        WHEN 'DISTINCT_WITH_JOIN'      THEN 8
+        WHEN 'REPEATED_BASE_TABLE_SCAN'THEN 9
+        WHEN 'IMPLICIT_TYPE_CAST'      THEN 10
+        WHEN 'ORDER_BY_NO_LIMIT'       THEN 11
+        WHEN 'SELECT_STAR'             THEN 12
+        ELSE                                13
+    END,
+    total_credits DESC;
