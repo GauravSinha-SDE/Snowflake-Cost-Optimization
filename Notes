@@ -1,3 +1,50 @@
+-- Identifies tables rebuilt repeatedly via CREATE OR REPLACE TRANSIENT TABLE
+-- Fix: non-capturing groups (?:) → removed, \s → [[:space:]], \S → [^[:space:]]
 
-Invalid regular expression: 'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TRANSIENT\s+)?TABLE\s+(\S+)', no argument for repetition operator: ?
-
+WITH ctas_queries AS (
+    SELECT
+        REGEXP_SUBSTR(
+            UPPER(QUERY_TEXT),
+            'CREATE[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?(TRANSIENT[[:space:]]+)?TABLE[[:space:]]+([^[:space:]]+)',
+            1, 1, 'ie', 3          -- flag 'i'=case-insensitive, 'e'=extract, group 3 = table name
+        )                                              AS target_table,
+        QUERY_ID,
+        WAREHOUSE_NAME,
+        WAREHOUSE_SIZE,
+        USER_NAME,
+        ROLE_NAME,
+        START_TIME,
+        TOTAL_ELAPSED_TIME / 1000                      AS elapsed_sec,
+        (TOTAL_ELAPSED_TIME / 3600000.0)
+            * CASE WAREHOUSE_SIZE
+                WHEN 'X-Small' THEN 1
+                WHEN 'Small'   THEN 2
+                WHEN 'Medium'  THEN 4
+                WHEN 'Large'   THEN 8
+                ELSE 1 END                             AS est_credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE START_TIME        >= DATEADD('day', -14, CURRENT_TIMESTAMP)
+      AND QUERY_TYPE        IN ('CREATE_TABLE_AS_SELECT', 'CREATE_TABLE')
+      AND EXECUTION_STATUS  = 'SUCCESS'
+      AND UPPER(QUERY_TEXT) LIKE '%CREATE%TABLE%SELECT%'
+),
+aggregated AS (
+    SELECT
+        target_table,
+        COUNT(*)                                       AS rebuild_count,
+        ROUND(SUM(est_credits), 4)                     AS total_credits,
+        ROUND(AVG(elapsed_sec), 1)                     AS avg_elapsed_sec,
+        MIN(START_TIME)                                AS first_run,
+        MAX(START_TIME)                                AS last_run,
+        ROUND(
+            DATEDIFF('hour', MIN(START_TIME), MAX(START_TIME))
+            / NULLIF(COUNT(*) - 1, 0), 2)             AS avg_hrs_between_runs,
+        MAX(WAREHOUSE_NAME)                            AS warehouse_name
+    FROM ctas_queries
+    WHERE target_table IS NOT NULL
+    GROUP BY target_table
+    HAVING COUNT(*) > 10
+)
+SELECT *
+FROM aggregated
+ORDER BY total_credits DESC;
