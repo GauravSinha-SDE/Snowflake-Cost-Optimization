@@ -1,1 +1,3 @@
 
+Invalid regular expression: 'CREATE\s+(?:OR\s+REPLACE\s+)?(?:TRANSIENT\s+)?TABLE\s+(\S+)', no argument for repetition operator: ?
+
